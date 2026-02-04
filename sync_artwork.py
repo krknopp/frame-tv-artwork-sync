@@ -446,26 +446,22 @@ class TVArtworkSync:
 
             logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} tracked to delete{f', {len(unknown_images)} unknown to delete' if REMOVE_UNKNOWN_IMAGES and unknown_images else ''}")
 
-            # Determine slideshow settings (only when images change)
-            slideshow_settings = None
+            # Determine desired slideshow settings from environment (checked every sync run)
+            desired_slideshow_settings = None
+            if SLIDESHOW_OVERRIDE and SLIDESHOW_ENABLED:
+                slideshow_type = 'shuffleslideshow' if SLIDESHOW_TYPE == 'shuffle' else 'slideshow'
+                desired_slideshow_settings = {
+                    'value': str(SLIDESHOW_INTERVAL),
+                    'type': slideshow_type,
+                    'category_id': 'MY-C0002'
+                }
 
+            # For image changes without override, we need to preserve TV's current settings
+            preserve_slideshow_settings = None
             if (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)) and local_images:
-                # Check if we should use override settings or preserve TV's current settings
-                if SLIDESHOW_OVERRIDE:
-                    # Use environment variable override settings
-                    if SLIDESHOW_ENABLED:
-                        slideshow_type = 'shuffleslideshow' if SLIDESHOW_TYPE == 'shuffle' else 'slideshow'
-                        slideshow_settings = {
-                            'value': str(SLIDESHOW_INTERVAL),
-                            'type': slideshow_type,
-                            'category_id': 'MY-C0002'
-                        }
-                        logger.info(f"Using slideshow override: {SLIDESHOW_INTERVAL} min, {SLIDESHOW_TYPE}")
-                    else:
-                        logger.info(f"Slideshow override set to disabled")
-                else:
-                    # Preserve and restore TV's current slideshow settings
-                    slideshow_settings = await self.get_slideshow_settings()
+                if not SLIDESHOW_OVERRIDE:
+                    # Preserve TV's current slideshow settings to restore after image changes
+                    preserve_slideshow_settings = await self.get_slideshow_settings()
 
             # Determine brightness to apply (every sync run, regardless of image changes)
             brightness_to_apply = None
@@ -518,13 +514,15 @@ class TVArtworkSync:
                     except Exception as e:
                         logger.warning(f"Error batch deleting unknown images from TV {self.tv_ip}: {e}")
 
-            # If we made changes and have images, select an image and restart slideshow
+            # If we made changes and have images, select an image and restore preserved slideshow
             if local_images and (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)):
                 if self.file_mapping:
                     try:
                         # Pick random image if shuffle mode, otherwise pick first
                         import random
-                        if slideshow_settings and slideshow_settings.get('type') == 'shuffleslideshow':
+                        # Use desired settings if available, otherwise preserved settings for shuffle check
+                        settings_for_mode = desired_slideshow_settings or preserve_slideshow_settings
+                        if settings_for_mode and settings_for_mode.get('type') == 'shuffleslideshow':
                             content_id = random.choice(list(self.file_mapping.values()))
                             if DRY_RUN:
                                 logger.info(f"[DRY RUN] Would select random image on TV {self.tv_ip} for shuffle mode")
@@ -540,12 +538,30 @@ class TVArtworkSync:
                         if not DRY_RUN:
                             await self.tv.select_image(content_id, show=True)
 
-                        # Apply slideshow settings (either from override or preserved from TV)
-                        if slideshow_settings:
-                            await self.restart_slideshow(slideshow_settings)
+                        # Restore preserved slideshow settings (when no override is set)
+                        if preserve_slideshow_settings:
+                            await self.restart_slideshow(preserve_slideshow_settings)
 
                     except Exception as e:
                         logger.warning(f"Failed to select image on TV {self.tv_ip}: {e}")
+
+            # Apply slideshow settings every sync run if override is set (compare with current to avoid unnecessary updates)
+            if desired_slideshow_settings:
+                try:
+                    current_settings = await self.get_slideshow_settings()
+                    # Check if settings differ (compare value and type)
+                    needs_update = (
+                        not current_settings or
+                        current_settings.get('value') != desired_slideshow_settings['value'] or
+                        current_settings.get('type') != desired_slideshow_settings['type']
+                    )
+                    if needs_update:
+                        logger.info(f"Slideshow settings changed, updating TV {self.tv_ip}: {desired_slideshow_settings['value']} min, {desired_slideshow_settings['type']}")
+                        await self.restart_slideshow(desired_slideshow_settings)
+                    else:
+                        logger.info(f"Slideshow settings unchanged on TV {self.tv_ip}")
+                except Exception as e:
+                    logger.warning(f"Failed to update slideshow settings on TV {self.tv_ip}: {e}")
 
             # Apply brightness every sync run (not just when images change)
             if brightness_to_apply is not None:
