@@ -73,6 +73,8 @@ All settings are configured via environment variables:
 | `BRIGHTNESS_MIN`           | Minimum brightness when sun is below horizon                                              | `2`       |
 | `BRIGHTNESS_MAX`           | Maximum brightness if sun were at zenith (90°)                                            | `10`      |
 | `REMOVE_UNKNOWN_IMAGES`    | Remove images from TV that aren't in the artwork folder (true/false)                      | `false`   |
+| `AUTO_OFF_TIME`            | Time to turn off TVs in art mode (24-hour format, e.g., `22:00`)                          | (unset)   |
+| `AUTO_OFF_GRACE_HOURS`     | Hours after `AUTO_OFF_TIME` to keep trying to turn off TVs                                | `2`       |
 
 ### Slideshow & Brightness Control
 
@@ -158,6 +160,41 @@ This displays hourly brightness levels for key solar positions (March Equinox, J
 - Removes any images from the TV that aren't in your local artwork folder
 - Ensures your TV only displays images from your synced collection
 - Useful for maintaining a "clean slate" that exactly matches your local folder
+
+### Auto-Off Control
+
+**`AUTO_OFF_TIME`** - Automatically turn off TVs at a specific time, but only when they're in art mode.
+
+This feature is useful when you want TVs to turn off at night but only if they're displaying art. If someone is actively watching the TV, it won't be interrupted.
+
+**How it works:**
+
+- Set `AUTO_OFF_TIME` to a time in 24-hour format (e.g., `22:00` for 10 PM)
+- The script checks during each sync if the current time is within the turn-off window
+- If a TV is in art mode during this window, it will be turned off after the sync completes
+- TVs not in art mode (e.g., watching HDMI content) are left alone
+
+**Grace period:**
+
+- `AUTO_OFF_GRACE_HOURS` defines how long after `AUTO_OFF_TIME` the script will keep trying to turn off TVs
+- Default is 2 hours, so if `AUTO_OFF_TIME=22:00`, it will try until midnight
+- After the grace period ends, the script stops attempting to turn off TVs until the next day
+- This handles cases where a TV wasn't in art mode at the exact off time
+
+**Example setup:**
+
+```bash
+AUTO_OFF_TIME=22:00
+AUTO_OFF_GRACE_HOURS=2
+LOCATION_TIMEZONE=America/New_York
+```
+
+With this configuration:
+- Starting at 10 PM (in your timezone), TVs in art mode will be turned off after sync
+- If a TV is being used at 10 PM but returns to art mode by 11 PM, it will be turned off then
+- After midnight, no turn-off attempts are made until the next day's 10 PM
+
+**Note:** `LOCATION_TIMEZONE` is required for this feature to work correctly.
 
 ## Image Requirements
 

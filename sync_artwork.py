@@ -17,6 +17,8 @@ import datetime
 import zoneinfo
 
 from samsungtvws.async_art import SamsungTVAsyncArt
+from samsungtvws.async_remote import SamsungTVWSAsyncRemote
+from samsungtvws.remote import SendRemoteKey
 from pysolar.solar import get_altitude
 
 # Configure logging
@@ -56,6 +58,10 @@ BRIGHTNESS_MAX = int(os.getenv('BRIGHTNESS_MAX', '10'))
 # Optional cleanup setting
 REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true', '1', 'yes')
 
+# Optional auto-off settings (turn off TVs at a specific time when in art mode)
+AUTO_OFF_TIME = os.getenv('AUTO_OFF_TIME', '')  # 24-hour format, e.g., "22:00"
+AUTO_OFF_GRACE_HOURS = float(os.getenv('AUTO_OFF_GRACE_HOURS', '2'))  # Hours after AUTO_OFF_TIME to keep trying
+
 # Dry run mode (set by command line argument)
 DRY_RUN = False
 
@@ -73,6 +79,51 @@ API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
 UPLOAD_ATTEMPTS = 2
+
+
+def is_within_auto_off_window() -> bool:
+    """
+    Check if the current time is within the auto-off window.
+
+    The window starts at AUTO_OFF_TIME and extends for AUTO_OFF_GRACE_HOURS.
+    Returns True if we should attempt to turn off TVs that are in art mode.
+    """
+    if not AUTO_OFF_TIME:
+        return False
+
+    try:
+        # Parse the configured off time
+        off_hour, off_minute = map(int, AUTO_OFF_TIME.split(':'))
+
+        # Get current time in the configured timezone
+        tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
+        now = datetime.datetime.now(tz)
+
+        # Create today's off time
+        today_off_time = now.replace(hour=off_hour, minute=off_minute, second=0, microsecond=0)
+
+        # Calculate the end of the grace period
+        grace_end = today_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
+
+        # Handle the case where the window spans midnight
+        # If we're before today's off time, check if we're in yesterday's window
+        if now < today_off_time:
+            yesterday_off_time = today_off_time - datetime.timedelta(days=1)
+            yesterday_grace_end = yesterday_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
+            if yesterday_off_time <= now < yesterday_grace_end:
+                logger.debug(f"Within auto-off window (from yesterday): {yesterday_off_time.strftime('%H:%M')} to {yesterday_grace_end.strftime('%H:%M')}")
+                return True
+
+        # Check if we're in today's window
+        if today_off_time <= now < grace_end:
+            logger.debug(f"Within auto-off window: {today_off_time.strftime('%H:%M')} to {grace_end.strftime('%H:%M')}")
+            return True
+
+        return False
+
+    except Exception as e:
+        logger.warning(f"Failed to check auto-off window: {e}")
+        return False
 
 
 def brightness_from_elevation(elevation: float) -> int:
@@ -422,6 +473,36 @@ class TVArtworkSync:
             logger.warning(f"Could not set brightness on TV {self.tv_ip}: {e}")
             return False
 
+    async def turn_off(self) -> bool:
+        """Turn off the TV via a separate remote control connection"""
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would turn off TV {self.tv_ip}")
+            return True
+
+        try:
+            logger.info(f"Turning off TV {self.tv_ip}")
+
+            # The art API uses a different websocket endpoint and can't send
+            # remote keys, so we need a separate remote control connection
+            remote = SamsungTVWSAsyncRemote(
+                host=self.tv_ip,
+                port=8002,
+                token_file=str(self.token_file),
+                timeout=CONNECTION_TIMEOUT
+            )
+            try:
+                # Frame TVs require holding the power button for 3 seconds to
+                # actually power off. A single press just toggles art mode.
+                await remote.send_commands(SendRemoteKey.hold("KEY_POWER", 3))
+                logger.info(f"Successfully turned off TV {self.tv_ip}")
+                return True
+            finally:
+                await remote.close()
+
+        except Exception as e:
+            logger.warning(f"Could not turn off TV {self.tv_ip}: {e}")
+            return False
+
     async def sync(self, local_images: Set[str] = None) -> bool:
         """Synchronize artwork with the TV"""
         try:
@@ -627,6 +708,13 @@ async def sync_all_tvs() -> None:
 
     # Sync all TVs that are in art mode with the same local images
     await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
+
+    # Check if we should turn off TVs (auto-off feature)
+    if is_within_auto_off_window():
+        grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
+        logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off TVs in art mode")
+        for tv_sync in tvs_to_sync:
+            await tv_sync.turn_off()
 
     # Close all connections
     await asyncio.gather(*[tv.close() for tv in tv_syncs])
