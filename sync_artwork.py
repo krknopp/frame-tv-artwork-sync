@@ -8,7 +8,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Set, Dict, Optional, Any
 import time
@@ -205,6 +207,21 @@ def calculate_solar_brightness() -> Optional[int]:
         return None
 
 
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize a filename by removing special characters.
+    Keeps alphanumeric, spaces, hyphens, underscores, and the file extension dot.
+    Collapses multiple spaces into one and strips leading/trailing spaces from the stem.
+    """
+    stem = Path(filename).stem
+    ext = Path(filename).suffix.lower()
+    # Keep only alphanumeric, spaces, hyphens, underscores
+    stem = re.sub(r'[^a-zA-Z0-9 _-]', '', stem)
+    # Collapse multiple spaces
+    stem = re.sub(r' +', ' ', stem).strip()
+    return f"{stem}{ext}" if stem else f"image{ext}"
+
+
 class TVArtworkSync:
     """Manages artwork synchronization for a Samsung Frame TV"""
 
@@ -344,44 +361,65 @@ class TVArtworkSync:
             return set(), set()
 
     async def upload_image(self, file_path: Path) -> bool:
-        """Upload a single image to the TV with retry logic"""
+        """Upload a single image to the TV with retry logic.
+        Uses a sanitized filename to avoid issues with special characters."""
         if DRY_RUN:
             logger.info(f"[DRY RUN] Would upload {file_path.name} to TV {self.tv_ip}")
             return True
 
-        for attempt in range(UPLOAD_ATTEMPTS):
-            try:
-                if attempt > 0:
-                    logger.info(f"Retrying upload of {file_path.name} to TV {self.tv_ip} (attempt {attempt + 1}/{UPLOAD_ATTEMPTS})")
-                else:
-                    logger.info(f"Uploading {file_path.name} to TV {self.tv_ip}")
+        # Create a temp copy with a sanitized filename
+        safe_name = sanitize_filename(file_path.name)
+        use_temp = safe_name != file_path.name
+        temp_dir = None
 
-                content_id = await self.tv.upload(
-                    file=str(file_path),
-                    file_type='png' if file_path.suffix.lower() == '.png' else 'jpg',
-                    matte=MATTE_STYLE if MATTE_STYLE != 'none' else None
-                )
+        try:
+            if use_temp:
+                temp_dir = tempfile.mkdtemp()
+                upload_path = Path(temp_dir) / safe_name
+                import shutil
+                shutil.copy2(file_path, upload_path)
+                logger.debug(f"Sanitized filename: {file_path.name} -> {safe_name}")
+            else:
+                upload_path = file_path
 
-                if content_id:
-                    # Save the mapping
-                    self.file_mapping[file_path.name] = content_id
-                    self._save_mapping()
-                    logger.info(f"Successfully uploaded {file_path.name} to TV {self.tv_ip} (content_id: {content_id})")
-                    return True
-                else:
-                    logger.warning(f"Upload returned no content_id for {file_path.name} to TV {self.tv_ip}")
+            for attempt in range(UPLOAD_ATTEMPTS):
+                try:
+                    if attempt > 0:
+                        logger.info(f"Retrying upload of {file_path.name} to TV {self.tv_ip} (attempt {attempt + 1}/{UPLOAD_ATTEMPTS})")
+                    else:
+                        logger.info(f"Uploading {file_path.name} to TV {self.tv_ip}")
+
+                    content_id = await self.tv.upload(
+                        file=str(upload_path),
+                        file_type='png' if file_path.suffix.lower() == '.png' else 'jpg',
+                        matte=MATTE_STYLE if MATTE_STYLE != 'none' else None
+                    )
+
+                    if content_id:
+                        # Save the mapping using the original filename as the key
+                        self.file_mapping[file_path.name] = content_id
+                        self._save_mapping()
+                        logger.info(f"Successfully uploaded {file_path.name} to TV {self.tv_ip} (content_id: {content_id})")
+                        return True
+                    else:
+                        logger.warning(f"Upload returned no content_id for {file_path.name} to TV {self.tv_ip}")
+                        if attempt < UPLOAD_ATTEMPTS - 1:
+                            await asyncio.sleep(UPLOAD_DELAY)
+                        continue
+
+                except Exception as e:
+                    logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
                     if attempt < UPLOAD_ATTEMPTS - 1:
                         await asyncio.sleep(UPLOAD_DELAY)
                     continue
 
-            except Exception as e:
-                logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
-                if attempt < UPLOAD_ATTEMPTS - 1:
-                    await asyncio.sleep(UPLOAD_DELAY)
-                continue
+            logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip} after {UPLOAD_ATTEMPTS} attempts")
+            return False
 
-        logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip} after {UPLOAD_ATTEMPTS} attempts")
-        return False
+        finally:
+            if temp_dir:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     async def get_slideshow_settings(self) -> Optional[Dict[str, Any]]:
         """Get current slideshow settings from the TV"""
