@@ -597,20 +597,29 @@ class TVArtworkSync:
 
             # If we made changes and have images, select an image and restore preserved slideshow
             if local_images and (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)):
-                if self.file_mapping:
+                # Verify file_mapping against what's actually on the TV now
+                verified_mapping = {}
+                try:
+                    current_on_tv, _ = await self.get_tv_images()
+                    verified_mapping = {k: v for k, v in self.file_mapping.items() if k in current_on_tv}
+                except Exception as e:
+                    logger.debug(f"Could not verify TV images for selection on {self.tv_ip}: {e}")
+                    verified_mapping = self.file_mapping
+
+                if verified_mapping:
                     try:
                         # Pick random image if shuffle mode, otherwise pick first
                         import random
                         # Use desired settings if available, otherwise preserved settings for shuffle check
                         settings_for_mode = desired_slideshow_settings or preserve_slideshow_settings
                         if settings_for_mode and settings_for_mode.get('type') == 'shuffleslideshow':
-                            content_id = random.choice(list(self.file_mapping.values()))
+                            content_id = random.choice(list(verified_mapping.values()))
                             if DRY_RUN:
                                 logger.info(f"[DRY RUN] Would select random image on TV {self.tv_ip} for shuffle mode")
                             else:
                                 logger.info(f"Selecting random image on TV {self.tv_ip} for shuffle mode")
                         else:
-                            content_id = list(self.file_mapping.values())[0]
+                            content_id = list(verified_mapping.values())[0]
                             if DRY_RUN:
                                 logger.info(f"[DRY RUN] Would select first image on TV {self.tv_ip} to prevent default art")
                             else:
@@ -625,6 +634,8 @@ class TVArtworkSync:
 
                     except Exception as e:
                         logger.warning(f"Failed to select image on TV {self.tv_ip}: {e}")
+                else:
+                    logger.warning(f"No verified images available on TV {self.tv_ip} to select, skipping image selection")
 
             # Apply slideshow settings every sync run if override is set (compare with current to avoid unnecessary updates)
             if desired_slideshow_settings:
