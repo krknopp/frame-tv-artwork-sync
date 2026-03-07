@@ -163,7 +163,7 @@ This displays hourly brightness levels for key solar positions (March Equinox, J
 
 ### Auto-Off Control
 
-**`AUTO_OFF_TIME`** - Automatically turn off TVs at a specific time, but only when they're in art mode.
+**`AUTO_OFF_TIME`** - Automatically turn off TVs at a specific time, but only when they're in art mode. This feature only works on some Frame TV models.
 
 This feature is useful when you want TVs to turn off at night but only if they're displaying art. If someone is actively watching the TV, it won't be interrupted.
 
@@ -190,11 +190,12 @@ LOCATION_TIMEZONE=America/New_York
 ```
 
 With this configuration:
+
 - Starting at 10 PM (in your timezone), TVs in art mode will be turned off after sync
 - If a TV is being used at 10 PM but returns to art mode by 11 PM, it will be turned off then
 - After midnight, no turn-off attempts are made until the next day's 10 PM
 
-**Note:** `LOCATION_TIMEZONE` is required for this feature to work correctly. This feature may not work on all Frame TV models.
+**Note:** `LOCATION_TIMEZONE` is required for this feature to work correctly.
 
 ## Image Requirements
 
