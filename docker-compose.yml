@@ -37,6 +37,9 @@ services:
       # When false, preserves any existing images already on the TV
       REMOVE_UNKNOWN_IMAGES: "false"
 
+      # Optional: Client name shown in the TV's authorized devices list
+      # CLIENT_NAME: "FrameTVArtworkSync"
+
       # Optional: Auto-Off Control
       # Turn off TVs at a specific time, but only when in art mode.
       # TVs being used for other content (e.g., HDMI) are left alone.

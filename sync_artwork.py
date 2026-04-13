@@ -20,7 +20,19 @@ import zoneinfo
 
 from samsungtvws.async_art import SamsungTVAsyncArt
 from samsungtvws.async_remote import SamsungTVWSAsyncRemote
-from samsungtvws.remote import SendRemoteKey
+from samsungtvws.remote import SamsungTVWS, SendRemoteKey
+
+# Patch SamsungTVAsyncArt.get_token to forward the name parameter.
+# The upstream library creates a temporary SamsungTVWS connection for token
+# negotiation but hardcodes the default name, causing a second auth prompt.
+_original_get_token = SamsungTVAsyncArt.get_token
+
+def _get_token_with_name(self):
+    SamsungTVWS(self.host, port=self.port, token=self.token,
+                token_file=self.token_file, timeout=self.timeout,
+                name=self.name)
+
+SamsungTVAsyncArt.get_token = _get_token_with_name
 from pysolar.solar import get_altitude
 
 # Configure logging
@@ -59,6 +71,9 @@ BRIGHTNESS_MAX = int(os.getenv('BRIGHTNESS_MAX', '10'))
 
 # Optional cleanup setting
 REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true', '1', 'yes')
+
+# Client name sent to the TV during WebSocket handshake
+CLIENT_NAME = os.getenv('CLIENT_NAME', 'FrameTVArtworkSync')
 
 # Optional auto-off settings (turn off TVs at a specific time when in art mode)
 AUTO_OFF_TIME = os.getenv('AUTO_OFF_TIME', '')  # 24-hour format, e.g., "22:00"
@@ -265,7 +280,8 @@ class TVArtworkSync:
                 host=self.tv_ip,
                 port=8002,
                 token_file=str(self.token_file),
-                timeout=CONNECTION_TIMEOUT
+                timeout=CONNECTION_TIMEOUT,
+                name=CLIENT_NAME
             )
 
             # Test connection by getting available art
@@ -526,7 +542,8 @@ class TVArtworkSync:
                 host=self.tv_ip,
                 port=8002,
                 token_file=str(self.token_file),
-                timeout=CONNECTION_TIMEOUT
+                timeout=CONNECTION_TIMEOUT,
+                name=CLIENT_NAME
             )
             try:
                 # Frame TVs require holding the power button for 3 seconds to
