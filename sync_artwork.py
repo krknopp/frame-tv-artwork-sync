@@ -91,7 +91,8 @@ if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
 # Timeout and delay constants (in seconds)
-CONNECTION_TIMEOUT = 10.0
+CONNECTION_TIMEOUT = float(os.getenv('CONNECTION_TIMEOUT', '10.0'))
+AUTH_TIMEOUT = float(os.getenv('AUTH_TIMEOUT', '30.0'))
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
@@ -272,19 +273,18 @@ class TVArtworkSync:
     async def connect(self) -> bool:
         """Connect to the TV"""
         try:
-            # Ensure token directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Create TV connection with timeout parameter
+            timeout = AUTH_TIMEOUT if not self.token_file.exists() else CONNECTION_TIMEOUT
+
             self.tv = SamsungTVAsyncArt(
                 host=self.tv_ip,
                 port=8002,
                 token_file=str(self.token_file),
-                timeout=CONNECTION_TIMEOUT,
+                timeout=timeout,
                 name=CLIENT_NAME
             )
 
-            # Test connection by getting available art
             await self.tv.available()
             logger.info(f"Successfully connected to TV at {self.tv_ip}")
             return True
@@ -293,6 +293,28 @@ class TVArtworkSync:
             logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
             return False
         except Exception as e:
+            # If we have a cached token and connection failed, it may be stale.
+            # Delete it and retry once with a fresh auth timeout.
+            if self.token_file.exists():
+                logger.warning(f"Connection failed with cached token for {self.tv_ip} ({e}), deleting stale token and retrying...")
+                self.token_file.unlink()
+                try:
+                    self.tv = SamsungTVAsyncArt(
+                        host=self.tv_ip,
+                        port=8002,
+                        token_file=str(self.token_file),
+                        timeout=AUTH_TIMEOUT,
+                        name=CLIENT_NAME
+                    )
+                    await self.tv.available()
+                    logger.info(f"Successfully re-authenticated to TV at {self.tv_ip}")
+                    return True
+                except asyncio.TimeoutError:
+                    logger.warning(f"Re-auth to TV at {self.tv_ip} timed out - approve the prompt on the TV within {AUTH_TIMEOUT}s")
+                    return False
+                except Exception as e2:
+                    logger.warning(f"Re-auth failed for TV at {self.tv_ip}: {e2}")
+                    return False
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
             return False
 
@@ -709,6 +731,7 @@ class TVArtworkSync:
                         logger.info(f"Slideshow settings unchanged on TV {self.tv_ip}")
                 except Exception as e:
                     logger.warning(f"Failed to update slideshow settings on TV {self.tv_ip}: {e}")
+
 
             # Apply brightness every sync run (not just when images change)
             if brightness_to_apply is not None:
