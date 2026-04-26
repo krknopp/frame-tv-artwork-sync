@@ -93,6 +93,7 @@ SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 # Timeout and delay constants (in seconds)
 CONNECTION_TIMEOUT = float(os.getenv('CONNECTION_TIMEOUT', '10.0'))
 AUTH_TIMEOUT = float(os.getenv('AUTH_TIMEOUT', '30.0'))
+KEEPALIVE_INTERVAL = int(os.getenv('KEEPALIVE_INTERVAL', '60'))  # seconds
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
@@ -271,12 +272,28 @@ class TVArtworkSync:
             logger.warning(f"Failed to save mapping file: {e}")
 
     async def connect(self) -> bool:
-        """Connect to the TV"""
+        """Connect to the TV, with retry logic for dropped channels and stale tokens."""
         try:
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
+            return await self._try_connect(use_existing_token=True)
+        except Exception as e:
+            logger.warning(f"Unexpected error connecting to TV at {self.tv_ip}: {e}")
+            return False
 
-            timeout = AUTH_TIMEOUT if not self.token_file.exists() else CONNECTION_TIMEOUT
+    async def _try_connect(self, use_existing_token: bool = True, attempt: int = 1) -> bool:
+        """
+        Internal connection helper with up to 3 attempts.
+        - Channel timeouts: retry with same token (connection dropped, not auth failure)
+        - Auth failures: delete token and retry once with fresh auth timeout
+        """
+        if attempt > 3:
+            logger.warning(f"Giving up connecting to TV at {self.tv_ip} after 3 attempts")
+            return False
 
+        token_exists = self.token_file.exists()
+        timeout = CONNECTION_TIMEOUT if (use_existing_token and token_exists) else AUTH_TIMEOUT
+
+        try:
             self.tv = SamsungTVAsyncArt(
                 host=self.tv_ip,
                 port=8002,
@@ -284,39 +301,32 @@ class TVArtworkSync:
                 timeout=timeout,
                 name=CLIENT_NAME
             )
-
             await self.tv.available()
-            logger.info(f"Successfully connected to TV at {self.tv_ip}")
+            logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
             return True
 
         except asyncio.TimeoutError:
             logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
             return False
+
         except Exception as e:
-            # If we have a cached token and connection failed, it may be stale.
-            # Delete it and retry once with a fresh auth timeout.
-            if self.token_file.exists():
-                logger.warning(f"Connection failed with cached token for {self.tv_ip} ({e}), deleting stale token and retrying...")
+            error_str = str(e)
+
+            if 'timeOut' in error_str:
+                # Channel dropped — token is likely still valid, just retry
+                logger.warning(f"Channel timed out for TV {self.tv_ip} (attempt {attempt}), retrying with existing token...")
+                await asyncio.sleep(2)
+                return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
+
+            elif token_exists and use_existing_token:
+                # Some other error with a cached token — assume it's stale and re-pair
+                logger.warning(f"Connection failed for {self.tv_ip} ({e}), deleting stale token and re-pairing...")
                 self.token_file.unlink()
-                try:
-                    self.tv = SamsungTVAsyncArt(
-                        host=self.tv_ip,
-                        port=8002,
-                        token_file=str(self.token_file),
-                        timeout=AUTH_TIMEOUT,
-                        name=CLIENT_NAME
-                    )
-                    await self.tv.available()
-                    logger.info(f"Successfully re-authenticated to TV at {self.tv_ip}")
-                    return True
-                except asyncio.TimeoutError:
-                    logger.warning(f"Re-auth to TV at {self.tv_ip} timed out - approve the prompt on the TV within {AUTH_TIMEOUT}s")
-                    return False
-                except Exception as e2:
-                    logger.warning(f"Re-auth failed for TV at {self.tv_ip}: {e2}")
-                    return False
-            logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
-            return False
+                return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
+
+            else:
+                logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
+                return False
 
     async def is_in_art_mode(self) -> bool:
         """Check if the TV is currently in art mode (not being used for other content)"""
@@ -529,9 +539,11 @@ class TVArtworkSync:
 
     async def set_brightness(self, brightness: int) -> bool:
         """Set brightness on the TV (0-50 range)"""
+
         if DRY_RUN:
             logger.info(f"[DRY RUN] Would set brightness to {brightness} on TV {self.tv_ip}")
             return True
+
 
         try:
             logger.info(f"Setting brightness to {brightness} on TV {self.tv_ip}")
@@ -732,7 +744,6 @@ class TVArtworkSync:
                 except Exception as e:
                     logger.warning(f"Failed to update slideshow settings on TV {self.tv_ip}: {e}")
 
-
             # Apply brightness every sync run (not just when images change)
             if brightness_to_apply is not None:
                 try:
@@ -746,16 +757,6 @@ class TVArtworkSync:
         except Exception as e:
             logger.warning(f"Error during sync for TV {self.tv_ip}: {e}")
             return False
-
-    async def close(self) -> None:
-        """Close connection to TV"""
-        if self.tv:
-            try:
-                await self.tv.close()
-            except Exception:
-                pass
-
-
 async def sync_all_tvs() -> None:
     """Synchronize artwork to all configured TVs"""
     if not TV_IPS:
@@ -764,10 +765,8 @@ async def sync_all_tvs() -> None:
 
     logger.info(f"Starting sync for {len(TV_IPS)} TV(s): {', '.join(TV_IPS)}")
 
-    # Create sync objects for each TV
     tv_syncs = [TVArtworkSync(ip) for ip in TV_IPS]
 
-    # Try to connect to each TV
     connected_tvs = []
     for tv_sync in tv_syncs:
         if await tv_sync.connect():
@@ -777,7 +776,6 @@ async def sync_all_tvs() -> None:
         logger.warning("No TVs are currently available")
         return
 
-    # Filter out TVs that are not in art mode (e.g., watching HDMI content)
     tvs_to_sync = []
     for tv_sync in connected_tvs:
         if await tv_sync.is_in_art_mode():
@@ -787,27 +785,34 @@ async def sync_all_tvs() -> None:
 
     if not tvs_to_sync:
         logger.info("No TVs in art mode to sync")
-        # Close all connections
         await asyncio.gather(*[tv.close() for tv in tv_syncs])
         return
 
-    # Get local images once (shared by all TVs)
-    logger.info(f"Syncing {len(tvs_to_sync)} TV(s) in art mode")
     local_images = await tvs_to_sync[0].get_local_images() if tvs_to_sync else set()
-
-    # Sync all TVs that are in art mode with the same local images
     await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
 
-    # Check if we should turn off TVs (auto-off feature)
     if is_within_auto_off_window():
         grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
         logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off TVs in art mode")
         for tv_sync in tvs_to_sync:
             await tv_sync.turn_off()
 
-    # Close all connections
-    await asyncio.gather(*[tv.close() for tv in tv_syncs])
+    # Keep connections alive until next sync instead of closing and reopening
+    logger.info(f"Keeping connections alive for {SYNC_INTERVAL_MINUTES} minute(s) until next sync...")
+    sync_interval_seconds = SYNC_INTERVAL_MINUTES * 60
+    elapsed = 0
+    while elapsed < sync_interval_seconds:
+        await asyncio.sleep(min(KEEPALIVE_INTERVAL, sync_interval_seconds - elapsed))
+        elapsed += KEEPALIVE_INTERVAL
+        if elapsed < sync_interval_seconds:
+            for tv_sync in tvs_to_sync:
+                try:
+                    await tv_sync.tv.available()
+                    logger.debug(f"Keepalive ping OK for TV {tv_sync.tv_ip}")
+                except Exception as e:
+                    logger.debug(f"Keepalive ping failed for TV {tv_sync.tv_ip}: {e}")
 
+    await asyncio.gather(*[tv.close() for tv in tv_syncs])
     logger.info("Sync cycle completed")
 
 
@@ -826,16 +831,12 @@ async def main() -> None:
         logger.error("No TV IPs configured. Exiting.")
         sys.exit(1)
 
-    sync_interval_seconds = SYNC_INTERVAL_MINUTES * 60
-
     while True:
         try:
             await sync_all_tvs()
         except Exception as e:
             logger.error(f"Error in sync cycle: {e}", exc_info=True)
-
-        logger.info(f"Waiting {SYNC_INTERVAL_MINUTES} minutes until next sync...")
-        await asyncio.sleep(sync_interval_seconds)
+            await asyncio.sleep(SYNC_INTERVAL_MINUTES * 60)
 
 
 if __name__ == '__main__':
