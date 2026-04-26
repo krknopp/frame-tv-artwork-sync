@@ -22,17 +22,6 @@ from samsungtvws.async_art import SamsungTVAsyncArt
 from samsungtvws.async_remote import SamsungTVWSAsyncRemote
 from samsungtvws.remote import SamsungTVWS, SendRemoteKey
 
-# Patch SamsungTVAsyncArt.get_token to forward the name parameter.
-# The upstream library creates a temporary SamsungTVWS connection for token
-# negotiation but hardcodes the default name, causing a second auth prompt.
-_original_get_token = SamsungTVAsyncArt.get_token
-
-def _get_token_with_name(self):
-    SamsungTVWS(self.host, port=self.port, token=self.token,
-                token_file=self.token_file, timeout=self.timeout,
-                name=self.name)
-
-SamsungTVAsyncArt.get_token = _get_token_with_name
 from pysolar.solar import get_altitude
 
 # Configure logging
@@ -281,16 +270,12 @@ class TVArtworkSync:
             return False
 
     async def _try_connect(self, use_existing_token: bool = True, attempt: int = 1) -> bool:
-        """
-        Internal connection helper with up to 3 attempts.
-        - Channel timeouts: retry with same token (connection dropped, not auth failure)
-        - Auth failures: delete token and retry once with fresh auth timeout
-        """
-        if attempt > 3:
-            logger.warning(f"Giving up connecting to TV at {self.tv_ip} after 3 attempts")
+        if attempt > 5:
+            logger.warning(f"Giving up connecting to TV at {self.tv_ip} after 5 attempts")
             return False
 
         token_exists = self.token_file.exists()
+
         timeout = CONNECTION_TIMEOUT if (use_existing_token and token_exists) else AUTH_TIMEOUT
 
         try:
@@ -301,25 +286,54 @@ class TVArtworkSync:
                 timeout=timeout,
                 name=CLIENT_NAME
             )
-            await self.tv.available()
-            logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
-            return True
+
+            t0 = time.monotonic()
+            if not token_exists:
+                # First-time pairing: the TV will issue a token then disconnect.
+                # Just wait for the token to be written, then reconnect cleanly.
+                logger.info(f"No token for TV {self.tv_ip}, waiting for pairing approval on TV...")
+                try:
+                    await self.tv.available()
+                except Exception:
+                    pass  # Expected disconnect after token issuance — ignore it
+
+                # Check if we got a token
+                if self.token_file.exists():
+                    logger.info(f"Token received, reconnecting to TV {self.tv_ip}...")
+                    await asyncio.sleep(2)
+                    return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
+                else:
+                    logger.warning(f"No token written after pairing attempt for TV {self.tv_ip}, retrying...")
+                    await asyncio.sleep(3)
+                    return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
+
+            else:
+                # Normal connection with existing token
+                await self.tv.available()
+                logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
+                return True
 
         except asyncio.TimeoutError:
             logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
             return False
 
         except Exception as e:
+            elapsed = time.monotonic() - t0
             error_str = str(e)
+            is_channel_drop = 'timeOut' in error_str or 'clientDisconnect' in error_str
 
-            if 'timeOut' in error_str:
-                # Channel dropped — token is likely still valid, just retry
-                logger.warning(f"Channel timed out for TV {self.tv_ip} (attempt {attempt}), retrying with existing token...")
-                await asyncio.sleep(2)
+            if is_channel_drop and elapsed < 1.0:
+                logger.warning(f"Instant channel drop for TV {self.tv_ip} — stale token, deleting and re-pairing...")
+                if self.token_file.exists():
+                    self.token_file.unlink()
+                return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
+
+            elif is_channel_drop:
+                logger.warning(f"Channel dropped for TV {self.tv_ip} (attempt {attempt}) after {elapsed:.2f}s, retrying with existing token...")
+                await asyncio.sleep(10)
                 return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
 
             elif token_exists and use_existing_token:
-                # Some other error with a cached token — assume it's stale and re-pair
                 logger.warning(f"Connection failed for {self.tv_ip} ({e}), deleting stale token and re-pairing...")
                 self.token_file.unlink()
                 return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
@@ -539,11 +553,9 @@ class TVArtworkSync:
 
     async def set_brightness(self, brightness: int) -> bool:
         """Set brightness on the TV (0-50 range)"""
-
         if DRY_RUN:
             logger.info(f"[DRY RUN] Would set brightness to {brightness} on TV {self.tv_ip}")
             return True
-
 
         try:
             logger.info(f"Setting brightness to {brightness} on TV {self.tv_ip}")
